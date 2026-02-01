@@ -10,14 +10,25 @@
 #include "renderer.h"
 #include "mandelbrot.h"
 
-#define DEBUG_THREAD (2)
+#define DEBUG_THREAD 2
+#define TIME_CALCULATE
+
+#ifdef TIME_CALCULATE
+#include <time.h>
+#endif
+
+#define MAX_THREADS 16
+#define MAX_QUEUE 100
 
 // User params
 volatile int desiredWidth = 622;
 volatile int desiredHeight = 433;
-volatile double desiredZoom = 1.4;
-volatile double desiredOffsetX = -0.6;
-volatile double desiredOffsetY = 0;
+// volatile double desiredZoom = 0.2;
+// volatile double desiredOffsetX = -0.6;
+// volatile double desiredOffsetY = 0;
+volatile double desiredZoom = 0.01;
+volatile double desiredOffsetX = -0.74;
+volatile double desiredOffsetY = -0.22;
 
 typedef struct {
     int width;
@@ -25,7 +36,7 @@ typedef struct {
     double pixelStep;
     double offsetX;
     double offsetY;
-} desiredParams;
+} DesiredParams;
 
 typedef struct {
     int tag;
@@ -36,19 +47,20 @@ typedef struct {
         in which case pan thread adjusts it before it displays. */
     bool freshlyCalculated;
     /** For what desired user params it was rendered */
-    desiredParams params;
+    DesiredParams params;
     /** How many pixels are missing in that direction */
     int missingL; int missingR; int missingT; int missingB;
     /**  */
     short stripeProgress; short stripeOffset;
-} bufferArray;
+} BufferArray;
 
-volatile bufferArray mainBuffer = { 0 };
-volatile bufferArray swapBuffer = { 0 };
+volatile BufferArray mainBuffer = { 0 };
+volatile BufferArray swapBuffer = { 0 };
 
 // Threading
-volatile HANDLE statusSemaphore = 0;
-volatile HANDLE bufferSemaphore = 0;
+HANDLE statusSemaphore = 0;
+HANDLE bufferSemaphore = 0;
+HANDLE taskSemaphore = 0;
 
 volatile bool threadsRunning = false;
 
@@ -58,6 +70,23 @@ unsigned __stdcall PanThreadFunction( void* pArguments );
 HANDLE calculateThreadPointer = 0;
 unsigned __stdcall CalculateThreadFunction( void* pArguments );
 
+unsigned int workerThreadCount = 0;
+HANDLE workerThreadPointers[MAX_THREADS] = { 0 };
+unsigned __stdcall WorkerThreadFunction( void* pArguments );
+
+typedef struct {
+    bool taken;
+    fracInt *target; int maxIters;
+    double centerX; double centerY;
+    double pixelStep;
+    int width; int height;
+    int xStart; int xEnd; int yStart; int yEnd;
+} WorkerTask;
+
+volatile WorkerTask taskQueue[MAX_QUEUE] = { 0 };
+volatile int tasksTotal = 0;
+volatile int tasksLeft = 0;
+
 // Fractal specific stuff
 int *palette = 0;
 const int maxIters = 1000;
@@ -65,19 +94,19 @@ const short striping = 4;
 
 DWORD waitForBufferSemaphore(DWORD ms, char label) {
     DWORD result = WaitForSingleObject(bufferSemaphore, ms);
-    if (DEBUG_THREAD >= 3)
+    if (DEBUG_THREAD >= 5)
         printf("%c Waited for bufferSemaphore: %d (%c)\n", label, result, result == 0 ? 's' : 'f');
     return result;
 }
 DWORD releaseBufferSemaphore(char label) {
     long count = -1;
     BOOL result = ReleaseSemaphore(bufferSemaphore, 1, &count);
-    if (DEBUG_THREAD >= 3)
+    if (DEBUG_THREAD >= 5)
         printf("%c Released bufferSemaphore: (%c) times %d\n", label, result != 0 ? 's' : 'f', count);
     return result;
 }
 
-int rendererInitialize() {
+int rendererInitialize(unsigned int inThreadCount) {
     palette = calloc(sizeof(int), (maxIters + 1) * 4);
     for (int i = 0; i < 20; i++) {
         palette[i * 4] = (i + 15) * 2;
@@ -94,12 +123,21 @@ int rendererInitialize() {
     if (!statusSemaphore) return 1;
     bufferSemaphore = CreateSemaphore(NULL, 1, 1, NULL);
     if (!bufferSemaphore) return 1;
+    taskSemaphore = CreateSemaphore(NULL, 1, 1, NULL);
+    if (!taskSemaphore) return 1;
 
+    workerThreadCount = min(16, max(1, inThreadCount));
     threadsRunning = true;
     panThreadPointer = (HANDLE)_beginthreadex(NULL, 0, PanThreadFunction, NULL, 0, NULL);
     if (!panThreadPointer) return 1;
     calculateThreadPointer = (HANDLE)_beginthreadex(NULL, 0, CalculateThreadFunction, NULL, 0, NULL);
     if (!calculateThreadPointer) return 1;
+
+    if (DEBUG_THREAD) printf("Starting %d worker threads\n", workerThreadCount);
+    for (int i = 0; i < workerThreadCount; i++) {
+        workerThreadPointers[i] = (HANDLE)_beginthreadex(NULL, 0, WorkerThreadFunction, (void*)(uintptr_t)i, 0, NULL);
+        if (!workerThreadPointers[i]) return 1;
+    }
 
     return 0;
 }
@@ -112,6 +150,9 @@ void rendererExit() {
     }
     if (calculateThreadPointer) {
         WaitForSingleObject(calculateThreadPointer, INFINITE);
+    }
+    if (calculateThreadPointer) {
+        WaitForMultipleObjects(workerThreadCount, workerThreadPointers, true, INFINITE);
     }
     if (DEBUG_THREAD) printf("Wait on buffer\n");
     if (bufferSemaphore) {
@@ -129,8 +170,8 @@ double getCurrentPixelStep() {
     return desiredZoom * 2 / min(desiredWidth, desiredHeight);
 }
 
-desiredParams getCurrentDesired() {
-    return (desiredParams){
+DesiredParams getCurrentDesired() {
+    return (DesiredParams){
         desiredWidth, desiredHeight,
         getCurrentPixelStep(),
         desiredOffsetX, desiredOffsetY,
@@ -145,7 +186,7 @@ unsigned __stdcall PanThreadFunction( void* pArguments ) {
     while (threadsRunning) {
         Sleep(3);
         if (WaitForSingleObject(statusSemaphore, 1000) != 0) continue;
-        desiredParams target = getCurrentDesired();
+        DesiredParams target = getCurrentDesired();
         ReleaseSemaphore(statusSemaphore, 1, NULL);
 
         if (waitForBufferSemaphore(3, 'P') != 0) {
@@ -159,7 +200,7 @@ unsigned __stdcall PanThreadFunction( void* pArguments ) {
                 if (DEBUG_THREAD >= 2) printf("Swap!!\n");
                 currentTag++;
 
-                bufferArray oldSwap = swapBuffer;
+                BufferArray oldSwap = swapBuffer;
                 swapBuffer = mainBuffer;
                 mainBuffer = oldSwap;
                 mainBuffer.freshlyCalculated = false;
@@ -238,13 +279,22 @@ void reallocSwapBuffer(int width, int height) {
  * Does fractal calculations in swapBuffer
  */
 unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
+    #ifdef TIME_CALCULATE
+    LARGE_INTEGER perfFrequency, perfStart, perfEnd;
+    QueryPerformanceFrequency(&perfFrequency);
+    #endif
+
     int lastTouchedTag = -1;
     while (threadsRunning) {
         // Get desired user params
         Sleep(3);
         if (WaitForSingleObject(statusSemaphore, 1000) != 0) continue;
-        desiredParams target = getCurrentDesired();
+        DesiredParams target = getCurrentDesired();
         ReleaseSemaphore(statusSemaphore, 1, NULL);
+
+        if (target.width < 4 && target.height < 4) {
+            continue;
+        }
         
         // WaitForSingleObject(bufferSemaphore, 5)
         if (waitForBufferSemaphore(5, 'C') != 0) {
@@ -270,8 +320,36 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
             releaseBufferSemaphore('C');
 
             if (DEBUG_THREAD >= 2) printf("Calculating scale!!\n");
-            calculate(target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                maxIters, swapArray, 0, target.width, 0, target.height);
+
+            // Schedule task regions
+            if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) {
+                fprintf(stderr, "Calculate thread could not acquire task semaphore\n");
+                continue;
+            }
+
+            tasksTotal = MAX_QUEUE;
+            tasksLeft = 0;
+            for (int y = 0; y < tasksTotal; y++) {
+                int top = (int)round((double)target.height / tasksTotal * y);
+                int bottom = (int)round((double)target.height / tasksTotal * (y + 1));
+                taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    0, target.width, top, bottom};
+                tasksLeft++;
+            }
+            #ifdef TIME_CALCULATE
+            QueryPerformanceCounter(&perfStart);
+            #endif
+            ReleaseSemaphore(taskSemaphore, 1, NULL);
+
+            while (tasksLeft > 0) {
+                Sleep(3);
+            }
+            
+            #ifdef TIME_CALCULATE
+            QueryPerformanceCounter(&perfEnd);
+            printf("Calculating zoom took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
+            #endif
 
             // Set finalized parameters
             swapBuffer.freshlyCalculated = true;
@@ -289,7 +367,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
 
             // Get relevant data from mainBuffer
             fracInt *swapArray = swapBuffer.array;
-            desiredParams target = mainBuffer.params;
+            DesiredParams target = mainBuffer.params;
             int missingL = mainBuffer.missingL, missingR = mainBuffer.missingR,
                 missingT = mainBuffer.missingT, missingB = mainBuffer.missingB;
             swapBuffer.wip = 1;
@@ -297,20 +375,24 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
             
             if (DEBUG_THREAD >= 2) printf("Calculating move!!\n");
             if (missingL) {
-                calculate(target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    maxIters, swapArray, 0, missingL, missingT, target.height - missingB);
+                calculate(swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    missingT, target.height - missingB, 0, missingL, false, 0, 0);
             }
             if (missingR) {
-                calculate(target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    maxIters, swapArray, target.width - missingR, target.width, missingT, target.height - missingB);
+                calculate(swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    missingT, target.height - missingB, target.width - missingR, target.width, false, 0, 0);
             }
             if (missingT) {
-                calculate(target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    maxIters, swapArray, 0, target.width, 0, missingT);
+                calculate(swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    0, missingT, 0, target.width, false, 0, 0);
             }
             if (missingB) {
-                calculate(target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    maxIters, swapArray, 0, target.width, target.height - missingB, target.height);
+                calculate(swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    target.height - missingB, target.height, 0, target.width, false, 0, 0);
             }
 
             // Set finalized parameters
@@ -325,6 +407,47 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
         }
     }
     if (DEBUG_THREAD) printf("Finishing CalculateThreadFunction\n");
+    return 0;
+}
+
+unsigned __stdcall WorkerThreadFunction( void* pArguments ) {
+    unsigned int workerId = (unsigned int)(uintptr_t)pArguments;
+    int currentTaskI = -1;
+    WorkerTask currentTask = { 0 };
+    while (threadsRunning) {
+        // If thread was performing a task last loop, don't waste time with Sleep
+        //if (currentTaskI == -1)
+            Sleep(3);
+
+        // Find next task
+        if (tasksLeft <= 0) continue;
+
+        currentTaskI = -1;
+        if (WaitForSingleObject(taskSemaphore, 1000) != 0) continue;
+        for (size_t i = 0; i < tasksTotal; i++) {
+            if (!taskQueue[i].taken) {
+                taskQueue[i].taken = true;
+                currentTaskI = i;
+                currentTask = taskQueue[i];
+                break;
+            }
+        }
+        ReleaseSemaphore(taskSemaphore, 1, NULL);
+        if (currentTaskI == -1) continue;
+
+        // Calculate
+        if (DEBUG_THREAD >= 3) printf("Calculating thread %d task %d\n", workerId, currentTaskI);
+        calculate(currentTask.target, currentTask.maxIters,
+            currentTask.centerX, currentTask.centerY, currentTask.pixelStep, currentTask.width, currentTask.height,
+            currentTask.yStart, currentTask.yEnd, currentTask.xStart, currentTask.xEnd, false, 0, 0);
+
+        // Announce task done
+        if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) continue;
+        if (DEBUG_THREAD >= 3) printf("Finished thread %d!!\n", workerId);
+        tasksLeft--;
+        ReleaseSemaphore(taskSemaphore, 1, NULL);
+    }
+    if (DEBUG_THREAD) printf("Finishing WorkerThreadFunction %d\n", workerId);
     return 0;
 }
 

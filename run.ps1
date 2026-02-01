@@ -1,3 +1,10 @@
+param(
+    [Parameter(Position=0)]
+    [int]$threads,
+
+    [switch]$console
+)
+
 if (-not (Test-Path -Path ".\out")) {
     New-Item -Path "." -Name "out" -ItemType "Directory"
 }
@@ -25,6 +32,16 @@ else
     echo "mtLocation.cfg not found. Configure this file with path to mt.exe file."
 }
 
-Remove-Item "out\brot.log"
-echo "Starting brot.exe"
-.\out\brot.exe *>"out\brot.log"
+if ( $console )
+{
+    .\out\brot.exe $threads
+}
+else
+{
+    Remove-Item "out\brot.log"
+    echo "Starting brot.exe"
+    Start-Process -FilePath ".\out\brot.exe $threads" `
+        -ArgumentList $threads `
+        -RedirectStandardOutput "out\brot.log" `
+        -NoNewWindow -Wait
+}

@@ -8,16 +8,12 @@
 
 #include "renderer.h"
 
+#define DEFAULT_WORKER_THREADS 3
+#define FRAME_RATE 60
+
 static bool quit = false;
 
 LRESULT CALLBACK WindowProcessMessage(HWND, UINT, WPARAM, LPARAM);
-#if RAND_MAX == 32767
-#define Rand32() ((rand() << 16) + (rand() << 1) + (rand() & 1))
-#else
-#define Rand32() rand()
-#endif
-
-#define FRAME_RATE 60
 
 static BITMAPINFO frame_bitmap_info;
 static HBITMAP frame_bitmap = 0;
@@ -41,10 +37,6 @@ struct {
     bool right;
 } MouseStatus;
 
-struct {
-    bool work;
-} PanStatus;
-
 Dimensions getRectDimensions(RECT* windowRect) {
     Dimensions result = {
         windowRect->right - windowRect->left,
@@ -53,10 +45,20 @@ Dimensions getRectDimensions(RECT* windowRect) {
     return result;
 }
 
-Dimensions getBorderDimensions(HWND window_handle) {
+Dimensions getClientDimensions(HWND windowHandle) {
+    RECT clientRect;
+    GetClientRect(windowHandle, &clientRect);
+    Dimensions result = {
+        clientRect.right - clientRect.left,
+        clientRect.bottom - clientRect.top
+    };
+    return result;
+}
+
+Dimensions getBorderDimensions(HWND windowHandle) {
     RECT windowRect, clientRect;
-    GetWindowRect(window_handle, &windowRect);
-    GetClientRect(window_handle, &clientRect);
+    GetWindowRect(windowHandle, &windowRect);
+    GetClientRect(windowHandle, &clientRect);
     Dimensions result = {
         windowRect.right - windowRect.left - (clientRect.right - clientRect.left),
         windowRect.bottom - windowRect.top - (clientRect.bottom - clientRect.top)
@@ -78,16 +80,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, 
     frame_bitmap_info.bmiHeader.biCompression = BI_RGB;
     frame_device_context = CreateCompatibleDC(0);
 
-    static HWND window_handle;
-    window_handle = CreateWindow(window_class_name, L"Fractal", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                                 640, 300, 640, 480, NULL, NULL, hInstance, NULL);
-    if(window_handle == NULL) { return -1; }
+    static HWND windowHandle;
+    windowHandle = CreateWindow(window_class_name, L"Fractal", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                 500, 40, 1200, 960, NULL, NULL, hInstance, NULL);
+    if(windowHandle == NULL) { return -1; }
     
-    if (rendererInitialize()) {
-        printf("Error initializing renderer\n");
+    unsigned int threadCount = atoi(pCmdLine);
+    if (threadCount == 0) threadCount = DEFAULT_WORKER_THREADS;
+    if (rendererInitialize(threadCount)) {
+        fprintf(stderr, "Error initializing renderer\n");
         rendererExit();
         return -1;
     }
+    Dimensions initialSize = getClientDimensions(windowHandle);
+    resizeFrame(initialSize.x, initialSize.y);
 
     timeBeginPeriod(1);
     LARGE_INTEGER perfFrequency, perfStart, perfNext, perfCurr;
@@ -128,8 +134,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, 
         perfNext.QuadPart += perfFrequency.QuadPart / FRAME_RATE;
 
         if (tryRedraw32(frame.pixels, frame.width, frame.height)) {
-            InvalidateRect(window_handle, NULL, FALSE);
-            UpdateWindow(window_handle);
+            InvalidateRect(windowHandle, NULL, FALSE);
+            UpdateWindow(windowHandle);
         }
     }
 
@@ -140,7 +146,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, 
 }
 
 
-LRESULT CALLBACK WindowProcessMessage(HWND window_handle, UINT message, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK WindowProcessMessage(HWND windowHandle, UINT message, WPARAM wParam, LPARAM lParam) {
     switch(message) {
         case WM_QUIT:
         case WM_DESTROY: {
@@ -150,14 +156,14 @@ LRESULT CALLBACK WindowProcessMessage(HWND window_handle, UINT message, WPARAM w
         case WM_PAINT: {
             static PAINTSTRUCT paint;
             static HDC device_context;
-            device_context = BeginPaint(window_handle, &paint);
+            device_context = BeginPaint(windowHandle, &paint);
             BitBlt(device_context,
                    paint.rcPaint.left, paint.rcPaint.top,
                    paint.rcPaint.right - paint.rcPaint.left, paint.rcPaint.bottom - paint.rcPaint.top,
                    frame_device_context,
                    paint.rcPaint.left, paint.rcPaint.top,
                    SRCCOPY);
-            EndPaint(window_handle, &paint);
+            EndPaint(windowHandle, &paint);
         } break;
 
         case WM_WINDOWPOSCHANGING: {
@@ -209,7 +215,7 @@ LRESULT CALLBACK WindowProcessMessage(HWND window_handle, UINT message, WPARAM w
         }
 
         default: {
-            return DefWindowProc(window_handle, message, wParam, lParam);
+            return DefWindowProc(windowHandle, message, wParam, lParam);
         }
     }
     return 0;

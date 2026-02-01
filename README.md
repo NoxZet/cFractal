@@ -11,7 +11,8 @@ To do:
 - Higher (arbitrary?) precision math.
 
 To run, you need to have gcc installed (MinGW is supported).
-- `run.ps1` compiles and executes `brot.exe`
+- `run.ps1 [threads] [-console]` compiles and executes `brot.exe`.
+  - `./run 7 -console` runs 7 worker threads and outputs to console instead of file
 - `runDrMem.ps1` compiles the program with `-gdwarf-2` argument and executes `drmemory brot.exe`. You must include drmemLocation.cfg file with the path to drmemory executable as its only contents.
 - `assembly.ps1` compiles each c file into an assembly file without producing an executable.
 
