@@ -10,7 +10,13 @@
 #include "renderer.h"
 #include "mandelbrot.h"
 
+// 1 = show initialization and exit details
+// 2 = show calculate operation starts and ends + swap
 #define DEBUG_THREAD 2
+#define DEBUG_PANNING 0
+#define DEBUG_BUFFER_SEMAPHORE 0
+#define DEBUG_WORKER 0
+#define DEBUG_REDRAW 0
 #define TIME_CALCULATE
 
 #ifdef TIME_CALCULATE
@@ -80,7 +86,9 @@ typedef struct {
     double centerX; double centerY;
     double pixelStep;
     int width; int height;
-    int xStart; int xEnd; int yStart; int yEnd;
+    int yStart; int yEnd;
+    int r1xStart; int r1xEnd;
+    bool region2; int r2xStart; int r2xEnd;
 } WorkerTask;
 
 volatile WorkerTask taskQueue[MAX_QUEUE] = { 0 };
@@ -94,14 +102,14 @@ const short striping = 4;
 
 DWORD waitForBufferSemaphore(DWORD ms, char label) {
     DWORD result = WaitForSingleObject(bufferSemaphore, ms);
-    if (DEBUG_THREAD >= 5)
+    if (DEBUG_BUFFER_SEMAPHORE)
         printf("%c Waited for bufferSemaphore: %d (%c)\n", label, result, result == 0 ? 's' : 'f');
     return result;
 }
 DWORD releaseBufferSemaphore(char label) {
     long count = -1;
     BOOL result = ReleaseSemaphore(bufferSemaphore, 1, &count);
-    if (DEBUG_THREAD >= 5)
+    if (DEBUG_BUFFER_SEMAPHORE)
         printf("%c Released bufferSemaphore: (%c) times %d\n", label, result != 0 ? 's' : 'f', count);
     return result;
 }
@@ -233,12 +241,12 @@ unsigned __stdcall PanThreadFunction( void* pArguments ) {
                     mainBuffer.missingL >= mainBuffer.params.width || mainBuffer.missingR >= mainBuffer.params.width
                     || mainBuffer.missingT >= mainBuffer.params.height || mainBuffer.missingB >= mainBuffer.params.height
                 )) {
-                    if (DEBUG_THREAD >= 2) printf("Panning!!\n");
+                    if (DEBUG_PANNING) printf("Panning!!\n");
                     int width = mainBuffer.params.width;
                     int rowLength = width - abs(shiftX);
                     int sourceX = shiftX > 0 ? 0 : -shiftX;
                     int targetX = shiftX > 0 ? shiftX : 0;
-                    if (DEBUG_THREAD >= 2) printf("SourceX %d, TargetX %d\n", sourceX, targetX);
+                    if (DEBUG_PANNING) printf("SourceX %d, TargetX %d\n", sourceX, targetX);
                     if (shiftY >= 0) {
                         int targetY = mainBuffer.params.height - 1;
                         int sourceY = targetY - shiftY;
@@ -334,7 +342,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                 int bottom = (int)round((double)target.height / tasksTotal * (y + 1));
                 taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
                     target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    0, target.width, top, bottom};
+                    top, bottom, 0, target.width, false, 0, 0};
                 tasksLeft++;
             }
             #ifdef TIME_CALCULATE
@@ -342,8 +350,18 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
             #endif
             ReleaseSemaphore(taskSemaphore, 1, NULL);
 
-            while (tasksLeft > 0) {
-                Sleep(3);
+            while (true) {
+                if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) {
+                    continue;
+                }
+                if (tasksLeft <= 0) {
+                    ReleaseSemaphore(taskSemaphore, 1, NULL);
+                    break;
+                }
+                else {
+                    ReleaseSemaphore(taskSemaphore, 1, NULL);
+                    Sleep(3);
+                }
             }
             
             #ifdef TIME_CALCULATE
@@ -370,35 +388,111 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
             DesiredParams target = mainBuffer.params;
             int missingL = mainBuffer.missingL, missingR = mainBuffer.missingR,
                 missingT = mainBuffer.missingT, missingB = mainBuffer.missingB;
+            if (missingL + missingR >= target.width || missingT + missingB >= target.height) {
+                missingL = target.width;
+                missingR = missingT = missingB = 0;
+            }
             swapBuffer.wip = 1;
             releaseBufferSemaphore('C');
             
             if (DEBUG_THREAD >= 2) printf("Calculating move!!\n");
-            if (missingL) {
-                calculate(swapArray, maxIters,
-                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    missingT, target.height - missingB, 0, missingL, false, 0, 0);
+
+            // Schedule task regions
+            if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) {
+                fprintf(stderr, "Calculate thread could not acquire task semaphore\n");
+                continue;
             }
-            if (missingR) {
-                calculate(swapArray, maxIters,
-                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    missingT, target.height - missingB, target.width - missingR, target.width, false, 0, 0);
+
+            int newArea = target.width * target.height
+                - (target.width - missingL - missingR) * (target.height - missingT - missingB);
+            tasksTotal = max(3, min(MAX_QUEUE, max(workerThreadCount, newArea / 10000)));
+            tasksLeft = 0;
+
+            int fullWidthTasks = 0;
+            if (missingT || missingB) {
+                // Use tasks out of the total pool based on proportional share of area
+                int fullWidthArea = target.width * (missingT + missingB);
+                fullWidthTasks = max(2, min(tasksTotal - 1, tasksTotal * fullWidthArea / newArea));
+                if (!missingL && !missingR) {
+                    fullWidthTasks = tasksTotal;
+                }
+                int topTasks = !missingT ? 0
+                             : !missingB ? fullWidthTasks
+                             : min(fullWidthTasks - 1, (1, (fullWidthTasks * missingT * target.width / fullWidthArea)));
+                int bottomTasks = fullWidthTasks - topTasks;
+
+                for (int y = 0; y < topTasks; y++) {
+                    int top = (int)round((double)missingT / topTasks * y);
+                    int bottom = (int)round((double)missingT / topTasks * (y + 1));
+                    if (bottom - top == 0) continue;
+                    taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
+                        target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        top, bottom, 0, target.width, false, 0, 0};
+                    tasksLeft++;
+                }
+                int paddingB = target.height - missingB;
+                for (int y = 0; y < bottomTasks; y++) {
+                    int top = paddingB + (int)round((double)missingB / bottomTasks * y);
+                    int bottom = paddingB + (int)round((double)missingB / bottomTasks * (y + 1));
+                    if (bottom - top == 0) continue;
+                    taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
+                        target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        top, bottom, 0, target.width, false, 0, 0};
+                    tasksLeft++;
+                }
             }
-            if (missingT) {
-                calculate(swapArray, maxIters,
-                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    0, missingT, 0, target.width, false, 0, 0);
+
+            if (missingL || missingR) {
+                int sideTasks = tasksTotal - fullWidthTasks;
+                int r1xStart, r1xEnd, r2xStart = 0, r2xEnd = 0;
+                bool region2 = false;
+                if (missingL && missingR) {
+                    r1xStart = 0;
+                    r1xEnd = missingL;
+                    region2 = true;
+                    r2xStart = target.width - missingR;
+                    r2xEnd = target.width;
+                } else if (missingL) {
+                    r1xStart = 0;
+                    r1xEnd = missingL;
+                } else {
+                    r1xStart = target.width - missingR;
+                    r1xEnd = target.width;
+                }
+                int height = target.height - missingB - missingT;
+                int padding = missingT;
+                for (int y = 0; y < sideTasks; y++) {
+                    int top = padding + (int)round((double)height / sideTasks * y);
+                    int bottom = padding + (int)round((double)height / sideTasks * (y + 1));
+                    if (bottom - top == 0) continue;
+                    taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
+                        target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        top, bottom, r1xStart, r1xEnd, region2, r2xStart, r2xEnd};
+                    tasksLeft++;
+                }
             }
-            if (missingB) {
-                calculate(swapArray, maxIters,
-                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
-                    target.height - missingB, target.height, 0, target.width, false, 0, 0);
+            
+            tasksTotal = tasksLeft;
+            
+            #ifdef TIME_CALCULATE
+            QueryPerformanceCounter(&perfStart);
+            #endif
+            ReleaseSemaphore(taskSemaphore, 1, NULL);
+
+            while (tasksLeft > 0) {
+                Sleep(3);
             }
+            
+            #ifdef TIME_CALCULATE
+            QueryPerformanceCounter(&perfEnd);
+            printf("Calculating move took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
+            #endif
 
             // Set finalized parameters
             swapBuffer.freshlyCalculated = true;
             swapBuffer.params = target;
             swapBuffer.missingB = swapBuffer.missingT = swapBuffer.missingL = swapBuffer.missingR = 0;
+            MemoryBarrier();
             swapBuffer.wip = 0;
             if (DEBUG_THREAD >= 2) printf("Done!!\n");
         }
@@ -416,7 +510,7 @@ unsigned __stdcall WorkerThreadFunction( void* pArguments ) {
     WorkerTask currentTask = { 0 };
     while (threadsRunning) {
         // If thread was performing a task last loop, don't waste time with Sleep
-        //if (currentTaskI == -1)
+        if (currentTaskI == -1)
             Sleep(3);
 
         // Find next task
@@ -436,14 +530,16 @@ unsigned __stdcall WorkerThreadFunction( void* pArguments ) {
         if (currentTaskI == -1) continue;
 
         // Calculate
-        if (DEBUG_THREAD >= 3) printf("Calculating thread %d task %d\n", workerId, currentTaskI);
+        if (DEBUG_WORKER) printf("Calculating thread %d task %d\n", workerId, currentTaskI);
         calculate(currentTask.target, currentTask.maxIters,
             currentTask.centerX, currentTask.centerY, currentTask.pixelStep, currentTask.width, currentTask.height,
-            currentTask.yStart, currentTask.yEnd, currentTask.xStart, currentTask.xEnd, false, 0, 0);
+            currentTask.yStart, currentTask.yEnd,
+            currentTask.r1xStart, currentTask.r1xEnd,
+            currentTask.region2, currentTask.r2xStart, currentTask.r2xEnd);
 
         // Announce task done
         if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) continue;
-        if (DEBUG_THREAD >= 3) printf("Finished thread %d!!\n", workerId);
+        if (DEBUG_WORKER) printf("Finished thread %d!!\n", workerId);
         tasksLeft--;
         ReleaseSemaphore(taskSemaphore, 1, NULL);
     }
@@ -462,10 +558,10 @@ void panFrame(int xPixels, int yPixels) {
 void zoomFrame(int xPixel, int yPixel, int level) {
     if (WaitForSingleObject(statusSemaphore, 100) != 0) return;
     if (level > 0) {
-        desiredZoom *= 1.4;
+        desiredZoom *= 1.5;
     }
     if (level < 0) {
-        desiredZoom /= 1.4;
+        desiredZoom /= 1.5;
     }
     ReleaseSemaphore(statusSemaphore, 1, NULL);
 }
@@ -481,6 +577,9 @@ int lastDraw = -1;
 bool tryRedraw32(uint32_t *pixels, int width, int height) {
     if (waitForBufferSemaphore(100, 'D') != 0) return false;
 
+    if (DEBUG_REDRAW)
+        printf("bfr.array %p, bfr.w %d == %d, bfr.h %d == %d\n",
+            mainBuffer.array, mainBuffer.params.width, width, mainBuffer.params.height, height);
     if (mainBuffer.array && mainBuffer.params.width == width && mainBuffer.params.height == height) {
         memset(pixels, 0, width * height * sizeof(uint32_t));
         uint8_t *pixelData = (uint8_t*)pixels;
