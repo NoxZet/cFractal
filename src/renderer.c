@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <time.h>
 
 #include "util.h"
 #include "renderer.h"
@@ -13,15 +14,12 @@
 // 1 = show initialization and exit details
 // 2 = show calculate operation starts and ends + swap
 #define DEBUG_THREAD 2
+#define DEBUG_STRIPING 0
 #define DEBUG_PANNING 0
 #define DEBUG_BUFFER_SEMAPHORE 0
 #define DEBUG_WORKER 0
 #define DEBUG_REDRAW 0
-#define TIME_CALCULATE
-
-#ifdef TIME_CALCULATE
-#include <time.h>
-#endif
+#define DEBUG_TIME 1
 
 #define MAX_THREADS 16
 #define MAX_QUEUE 100
@@ -44,6 +42,11 @@ typedef struct {
     double offsetY;
 } DesiredParams;
 
+#define STRIPING 3
+#define striping_row_started(arr, y) ((arr)[y][0] || (arr)[y][1] || (arr)[y][2])
+#define striping_row_done(arr, y) ((arr)[y][0] && (arr)[y][1] && (arr)[y][2])
+#define striping_done(arr) (striping_row_done(arr, 0) && striping_row_done(arr, 1) && striping_row_done(arr, 2))
+
 typedef struct {
     int tag;
     fracInt *array;
@@ -56,8 +59,10 @@ typedef struct {
     DesiredParams params;
     /** How many pixels are missing in that direction */
     int missingL; int missingR; int missingT; int missingB;
-    /**  */
-    short stripeProgress; short stripeOffset;
+    /** Current striping status - also modified when panning */
+    bool stripeProgress[STRIPING][STRIPING];
+    /** How many microseconds the first row took to determine how striped the other stripes should be */
+    int rowMicros;
 } BufferArray;
 
 volatile BufferArray mainBuffer = { 0 };
@@ -86,6 +91,8 @@ typedef struct {
     double centerX; double centerY;
     double pixelStep;
     int width; int height;
+    short hstriping; short hstripeOffset; bool hfillIn;
+    short vstriping; short vstripeOffset; bool vfillIn;
     int yStart; int yEnd;
     int r1xStart; int r1xEnd;
     bool region2; int r2xStart; int r2xEnd;
@@ -98,7 +105,6 @@ volatile int tasksLeft = 0;
 // Fractal specific stuff
 int *palette = 0;
 const int maxIters = 1000;
-const short striping = 4;
 
 DWORD waitForBufferSemaphore(DWORD ms, char label) {
     DWORD result = WaitForSingleObject(bufferSemaphore, ms);
@@ -211,6 +217,10 @@ unsigned __stdcall PanThreadFunction( void* pArguments ) {
                 BufferArray oldSwap = swapBuffer;
                 swapBuffer = mainBuffer;
                 mainBuffer = oldSwap;
+                if (DEBUG_STRIPING >= 2) printf("Progress on main after swap: {%c%c%c}{%c%c%c}{%c%c%c}\n",
+                    mainBuffer.stripeProgress[0][0]?'-':' ', mainBuffer.stripeProgress[0][1]?'-':' ', mainBuffer.stripeProgress[0][2]?'-':' ',
+                    mainBuffer.stripeProgress[1][0]?'-':' ', mainBuffer.stripeProgress[1][1]?'-':' ', mainBuffer.stripeProgress[1][2]?'-':' ',
+                    mainBuffer.stripeProgress[2][0]?'-':' ', mainBuffer.stripeProgress[2][1]?'-':' ', mainBuffer.stripeProgress[2][2]?'-':' ');
                 mainBuffer.freshlyCalculated = false;
                 mainBuffer.tag = currentTag;
             }
@@ -235,18 +245,39 @@ unsigned __stdcall PanThreadFunction( void* pArguments ) {
                 mainBuffer.params.offsetX = target.offsetX;
                 mainBuffer.params.offsetY = target.offsetY;
                 mainBuffer.tag = currentTag;
+
+                // Shift stripe progress
+                if (!striping_done(mainBuffer.stripeProgress)) {
+                    int cols = (shiftX + STRIPING * 10000) % STRIPING;
+                    int rows = (shiftY + STRIPING * 10000) % STRIPING;
+                    bool *progress = (bool*)mainBuffer.stripeProgress;
+                    if (cols != 0) {
+                        bool tmp[STRIPING - 1];
+                        for (size_t y = 0; y < STRIPING; y++) {
+                            bool *progress = (bool*)mainBuffer.stripeProgress;
+                            memcpy(tmp, progress + STRIPING - cols, cols * sizeof(bool));
+                            memmove(progress + cols, progress, (STRIPING - cols) * sizeof(bool));
+                            memcpy(progress, tmp, cols * sizeof(bool));
+                        }
+                    }
+                    if (rows != 0) {
+                        bool tmp[STRIPING - 1][STRIPING];
+                        memcpy(tmp, progress + (STRIPING - rows) * STRIPING, rows * STRIPING * sizeof(bool));
+                        memmove(progress + rows * STRIPING, progress, (STRIPING - rows) * STRIPING * sizeof(bool));
+                        memcpy(progress, tmp, rows * STRIPING * sizeof(bool));
+                    }
+                }
                 
                 // Pan the buffer array (move the content data based on pan)
                 if (!(
                     mainBuffer.missingL >= mainBuffer.params.width || mainBuffer.missingR >= mainBuffer.params.width
                     || mainBuffer.missingT >= mainBuffer.params.height || mainBuffer.missingB >= mainBuffer.params.height
                 )) {
-                    if (DEBUG_PANNING) printf("Panning!!\n");
+                    if (DEBUG_PANNING) printf("Panning by x: %d; y: %d!!\n", shiftX, shiftY);
                     int width = mainBuffer.params.width;
                     int rowLength = width - abs(shiftX);
                     int sourceX = shiftX > 0 ? 0 : -shiftX;
                     int targetX = shiftX > 0 ? shiftX : 0;
-                    if (DEBUG_PANNING) printf("SourceX %d, TargetX %d\n", sourceX, targetX);
                     if (shiftY >= 0) {
                         int targetY = mainBuffer.params.height - 1;
                         int sourceY = targetY - shiftY;
@@ -287,10 +318,8 @@ void reallocSwapBuffer(int width, int height) {
  * Does fractal calculations in swapBuffer
  */
 unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
-    #ifdef TIME_CALCULATE
     LARGE_INTEGER perfFrequency, perfStart, perfEnd;
     QueryPerformanceFrequency(&perfFrequency);
-    #endif
 
     int lastTouchedTag = -1;
     while (threadsRunning) {
@@ -322,6 +351,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                 reallocSwapBuffer(target.width, target.height);
             }
             fracInt *swapArray = swapBuffer.array;
+            MemoryBarrier();
             // While wip is set to > 0, main/pan threads aren't allowed to touch it
             swapBuffer.wip = 1;
             // ReleaseSemaphore(bufferSemaphore, 1, NULL)
@@ -335,47 +365,160 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                 continue;
             }
 
-            tasksTotal = MAX_QUEUE;
+            tasksTotal = min(MAX_QUEUE, target.height * 3);
             tasksLeft = 0;
             for (int y = 0; y < tasksTotal; y++) {
                 int top = (int)round((double)target.height / tasksTotal * y);
                 int bottom = (int)round((double)target.height / tasksTotal * (y + 1));
                 taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
                     target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    STRIPING, 0, true, STRIPING, 0, true,
                     top, bottom, 0, target.width, false, 0, 0};
                 tasksLeft++;
             }
-            #ifdef TIME_CALCULATE
             QueryPerformanceCounter(&perfStart);
-            #endif
             ReleaseSemaphore(taskSemaphore, 1, NULL);
 
-            while (true) {
-                if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) {
-                    continue;
-                }
-                if (tasksLeft <= 0) {
-                    ReleaseSemaphore(taskSemaphore, 1, NULL);
-                    break;
-                }
-                else {
-                    ReleaseSemaphore(taskSemaphore, 1, NULL);
-                    Sleep(3);
-                }
+            while (tasksLeft >= 1) {
+                Sleep(3);
             }
             
-            #ifdef TIME_CALCULATE
             QueryPerformanceCounter(&perfEnd);
-            printf("Calculating zoom took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
-            #endif
+            swapBuffer.rowMicros = (perfEnd.QuadPart * 1000000 - perfStart.QuadPart * 1000000) / perfFrequency.QuadPart;
+            if (DEBUG_TIME) {
+                printf("Calculating scale took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
+            }
 
             // Set finalized parameters
             swapBuffer.freshlyCalculated = true;
             swapBuffer.params = target;
             swapBuffer.missingB = swapBuffer.missingT = swapBuffer.missingL = swapBuffer.missingR = 0;
+            memset((bool*)swapBuffer.stripeProgress, false, sizeof(swapBuffer.stripeProgress));
+            swapBuffer.stripeProgress[0][0] = true;
             MemoryBarrier();
             swapBuffer.wip = 0;
             if (DEBUG_THREAD >= 2) printf("Done!!\n");
+        }
+        else if (!striping_done(mainBuffer.stripeProgress)) {
+            DesiredParams target = mainBuffer.params;
+            int missingL = mainBuffer.missingL, missingR = mainBuffer.missingR,
+                missingT = mainBuffer.missingT, missingB = mainBuffer.missingB;
+            // There is no partial area left, which makes it technically complete
+            if (missingL + missingR >= target.width || missingT + missingB >= target.height) {
+                memset((bool*)swapBuffer.stripeProgress, true, sizeof(swapBuffer.stripeProgress));
+                releaseBufferSemaphore('C');
+                continue;
+            }
+
+            lastTouchedTag = mainBuffer.tag;
+            if (!swapBuffer.array || swapBuffer.params.width != mainBuffer.params.width || swapBuffer.params.height != mainBuffer.params.height) {
+                reallocSwapBuffer(mainBuffer.params.width, mainBuffer.params.height);
+            }
+            memcpy(swapBuffer.array, mainBuffer.array, mainBuffer.params.width * mainBuffer.params.height * sizeof(fracInt));
+
+            // Get relevant data from mainBuffer
+            fracInt *swapArray = swapBuffer.array;
+            int rowMicros = mainBuffer.rowMicros;
+            bool stripeProgress[STRIPING][STRIPING];
+            memcpy(stripeProgress, (bool*)mainBuffer.stripeProgress, sizeof(stripeProgress));
+
+            MemoryBarrier();
+            swapBuffer.wip = 1;
+            releaseBufferSemaphore('C');
+            
+            if (DEBUG_STRIPING) printf("Calculating scale striping progress!!\n");
+
+            // Schedule task regions
+            if (WaitForSingleObject(taskSemaphore, INFINITE) != 0) {
+                fprintf(stderr, "Calculate thread could not acquire task semaphore\n");
+                continue;
+            }
+
+            // Find the correct stripes to do next
+            if (DEBUG_STRIPING >= 2) printf("Progress before calculation: {%c%c%c}{%c%c%c}{%c%c%c}\n",
+                stripeProgress[0][0]?'-':' ', stripeProgress[0][1]?'-':' ', stripeProgress[0][2]?'-':' ',
+                stripeProgress[1][0]?'-':' ', stripeProgress[1][1]?'-':' ', stripeProgress[1][2]?'-':' ',
+                stripeProgress[2][0]?'-':' ', stripeProgress[2][1]?'-':' ', stripeProgress[2][2]?'-':' ');
+            size_t finishedRowCount = 0;
+            size_t rowStarted = 100;
+            size_t rowNotStarted = 100;
+            for (size_t row = 0; row < STRIPING; row++) {
+                if (striping_row_done(stripeProgress, row))
+                    finishedRowCount++;
+                else if (striping_row_started(stripeProgress, row))
+                    rowStarted = row;
+                else
+                    rowNotStarted = row;
+            }
+
+            size_t vstripe = 0;
+            size_t hstriping = 0;
+            size_t hstripe = 0;
+            bool hfillIn = false;
+            // Unfinished row, do its last unfinished column
+            if (rowStarted != 100) {
+                vstripe = rowStarted;
+                hstriping = STRIPING;
+                for (size_t col = 0; col < STRIPING; col++) {
+                    if (!stripeProgress[rowStarted][col])
+                        hstripe = col;
+                }
+                stripeProgress[rowStarted][hstripe] = true;
+            }
+            // Start/do last unstarted row
+            else {
+                vstripe = rowNotStarted;
+                if (finishedRowCount == 0 || rowMicros >= 80 * 1000) {
+                    hstriping = STRIPING;
+                    hfillIn = true;
+                    stripeProgress[vstripe][0] = true;
+                } else {
+                    for (size_t col = 0; col < STRIPING; col++)
+                        stripeProgress[vstripe][col] = true;
+                }
+            }
+            
+            // memset(stripeProgress, true, sizeof(stripeProgress));
+
+            int height = target.height - missingB - missingT;
+            tasksTotal = min(MAX_QUEUE, height * 3);
+            int padding = missingT;
+            tasksLeft = 0;
+            for (int y = 0; y < tasksTotal; y++) {
+                int top = padding + (int)round((double)height / tasksTotal * y);
+                int bottom = padding + (int)round((double)height / tasksTotal * (y + 1));
+                taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
+                    target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                    hstriping, hstripe, hfillIn, STRIPING, vstripe, false,
+                    top, bottom, missingL, target.width - missingR, false, 0, 0};
+                tasksLeft++;
+            }
+
+            if (DEBUG_STRIPING >= 2) printf("Calculating for yoff=%d; xoff=%d/%d fill:%c\n",
+                vstripe, hstripe, hstriping, hfillIn ? 'Y' : 'N');
+            QueryPerformanceCounter(&perfStart);
+            ReleaseSemaphore(taskSemaphore, 1, NULL);
+
+            while (tasksLeft >= 1) {
+                Sleep(3);
+            }
+            
+            QueryPerformanceCounter(&perfEnd);
+            if (finishedRowCount == 0)
+                swapBuffer.rowMicros += (perfEnd.QuadPart * 1000000 - perfStart.QuadPart * 1000000) / perfFrequency.QuadPart;
+            if (DEBUG_TIME) {
+                printf("Calculating scale striping progress took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
+            }
+
+            // Set finalized parameters
+            swapBuffer.freshlyCalculated = true;
+            swapBuffer.params = target;
+            swapBuffer.missingB = missingB; swapBuffer.missingT = missingT;
+            swapBuffer.missingL = missingL; swapBuffer.missingR = missingR;
+            memcpy((bool*)swapBuffer.stripeProgress, stripeProgress, sizeof(stripeProgress));
+            MemoryBarrier();
+            swapBuffer.wip = 0;
+            if (DEBUG_STRIPING) printf("Done!!\n");
         }
         else if (mainBuffer.missingL || mainBuffer.missingR || mainBuffer.missingT || mainBuffer.missingB) {
             if (!swapBuffer.array || swapBuffer.params.width != mainBuffer.params.width || swapBuffer.params.height != mainBuffer.params.height) {
@@ -427,6 +570,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                     if (bottom - top == 0) continue;
                     taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
                         target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        0, 0, false, 0, 0, false,
                         top, bottom, 0, target.width, false, 0, 0};
                     tasksLeft++;
                 }
@@ -437,6 +581,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                     if (bottom - top == 0) continue;
                     taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
                         target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        0, 0, false, 0, 0, false,
                         top, bottom, 0, target.width, false, 0, 0};
                     tasksLeft++;
                 }
@@ -467,6 +612,7 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
                     if (bottom - top == 0) continue;
                     taskQueue[tasksLeft] = (WorkerTask){false, swapArray, maxIters,
                         target.offsetX, target.offsetY, target.pixelStep, target.width, target.height,
+                        0, 0, false, 0, 0, false,
                         top, bottom, r1xStart, r1xEnd, region2, r2xStart, r2xEnd};
                     tasksLeft++;
                 }
@@ -474,19 +620,19 @@ unsigned __stdcall CalculateThreadFunction( void* pArguments ) {
             
             tasksTotal = tasksLeft;
             
-            #ifdef TIME_CALCULATE
-            QueryPerformanceCounter(&perfStart);
-            #endif
+            if (DEBUG_TIME) {
+                QueryPerformanceCounter(&perfStart);
+            }
             ReleaseSemaphore(taskSemaphore, 1, NULL);
 
             while (tasksLeft > 0) {
                 Sleep(3);
             }
             
-            #ifdef TIME_CALCULATE
-            QueryPerformanceCounter(&perfEnd);
-            printf("Calculating move took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
-            #endif
+            if (DEBUG_TIME) {
+                QueryPerformanceCounter(&perfEnd);
+                printf("Calculating move took %dms\n", (perfEnd.QuadPart * 1000 - perfStart.QuadPart * 1000) / perfFrequency.QuadPart);
+            }
 
             // Set finalized parameters
             swapBuffer.freshlyCalculated = true;
@@ -513,10 +659,10 @@ unsigned __stdcall WorkerThreadFunction( void* pArguments ) {
         if (currentTaskI == -1)
             Sleep(3);
 
+        currentTaskI = -1;
         // Find next task
         if (tasksLeft <= 0) continue;
 
-        currentTaskI = -1;
         if (WaitForSingleObject(taskSemaphore, 1000) != 0) continue;
         for (size_t i = 0; i < tasksTotal; i++) {
             if (!taskQueue[i].taken) {
@@ -533,6 +679,8 @@ unsigned __stdcall WorkerThreadFunction( void* pArguments ) {
         if (DEBUG_WORKER) printf("Calculating thread %d task %d\n", workerId, currentTaskI);
         calculate(currentTask.target, currentTask.maxIters,
             currentTask.centerX, currentTask.centerY, currentTask.pixelStep, currentTask.width, currentTask.height,
+            currentTask.hstriping, currentTask.hstripeOffset, currentTask.hfillIn,
+            currentTask.vstriping, currentTask.vstripeOffset, currentTask.vfillIn,
             currentTask.yStart, currentTask.yEnd,
             currentTask.r1xStart, currentTask.r1xEnd,
             currentTask.region2, currentTask.r2xStart, currentTask.r2xEnd);
